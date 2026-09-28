@@ -1,0 +1,215 @@
+# OWASP Top 10 2025 — A02 Security Misconfiguration
+# Copy to: .github/workflows/owasp-a02-misconfig.yml
+#
+# Required repo variable or secret:
+#   APP_URL  e.g. https://staging.example.com
+#
+# Optional:
+#   NUCLEI_TARGETS  extra hosts/IPs, one per line (network checks)
+#
+# This job is read-only scanning. Only point it at systems you own.
+
+name: OWASP A02 Security Misconfiguration
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"   # weekly Monday 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: a02-misconfig-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_URL: ${{ vars.APP_URL || secrets.APP_URL || 'https://example.com' }}
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1) Live application: headers, cookies, CORS, default pages, TLS
+  # ------------------------------------------------------------------
+  zap-dast:
+    name: ZAP baseline (app)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ env.APP_URL }}
+          fail_action: false
+          allow_issue_writing: false
+          cmd_options: "-a -j"
+          artifact_name: zap-a02-report
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-a02-report
+          path: |
+            report_html.html
+            report_json.json
+            report_md.md
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # 2) Known misconfigs / exposures / default logins on the app URL
+  # ------------------------------------------------------------------
+  nuclei-app:
+    name: Nuclei misconfig (app)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Nuclei
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: ${{ env.APP_URL }}
+          flags: >-
+            -tags misconfig,exposure,default-login,ssl,headers,takeover,tech
+            -severity critical,high,medium
+            -no-interactsh
+            -rate-limit 50
+            -o nuclei-app.txt
+            -je nuclei-app.json
+
+      - name: Upload Nuclei app results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei-app-report
+          path: |
+            nuclei-app.txt
+            nuclei-app.json
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # 3) TLS / HTTPS hardening
+  # ------------------------------------------------------------------
+  tls:
+    name: TLS check (testssl)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout testssl.sh
+        uses: actions/checkout@v4
+        with:
+          repository: drwetter/testssl.sh
+          path: testssl
+
+      - name: Run testssl.sh
+        run: |
+          mkdir -p out
+          ./testssl/testssl.sh --fast --htmlfile out/testssl.html \
+            --jsonfile-pretty out/testssl.json \
+            --warnings off \
+            "${APP_URL}" || true
+
+      - name: Upload TLS report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testssl-report
+          path: out/
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # 4) IaC / container / repo misconfig (shift-left)
+  # ------------------------------------------------------------------
+  trivy-config:
+    name: Trivy IaC + secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy config + secret scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: CRITICAL,HIGH,MEDIUM
+          format: sarif
+          output: trivy-a02.sarif
+          exit-code: "0"
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-a02.sarif
+          category: trivy-a02
+
+      - name: Upload Trivy SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-a02-sarif
+          path: trivy-a02.sarif
+
+  checkov:
+    name: Checkov IaC
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          soft_fail: true
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          quiet: false
+
+      - name: Upload Checkov SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov-a02
+        continue-on-error: true
+
+  # ------------------------------------------------------------------
+  # 5) Optional network pass (set secret NUCLEI_TARGETS)
+  #    One host or IP per line. Leave unset to skip.
+  # ------------------------------------------------------------------
+  nuclei-network:
+    name: Nuclei misconfig (network)
+    runs-on: ubuntu-latest
+    if: ${{ secrets.NUCLEI_TARGETS != '' }}
+    steps:
+      - name: Write target list
+        env:
+          TARGETS: ${{ secrets.NUCLEI_TARGETS }}
+        run: printf '%s\n' "$TARGETS" > targets.txt
+
+      - name: Run Nuclei against network targets
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: targets.txt
+          flags: >-
+            -tags network,misconfig,default-login,ssl,exposure
+            -severity critical,high,medium
+            -no-interactsh
+            -rate-limit 30
+            -o nuclei-net.txt
+            -je nuclei-net.json
+
+      - name: Upload Nuclei network results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei-network-report
+          path: |
+            nuclei-net.txt
+            nuclei-net.json
+          if-no-files-found: ignore
